@@ -37,15 +37,12 @@ int proxy_loop_do(cmdopts_t *opts)
     int retcode = 0;
 
     /* POLL API is good enough here since we have two sockets only with different types
-     * for multiple-connection cases EPOLL would be right choice
-     */
+     * for multiple-connection cases EPOLL would be better choice */
     struct pollfd pfds[2] = {{.fd = -1}, {.fd = -1}};
     struct pollfd *dw_pfd = &pfds[0];
     struct pollfd *up_pfd = &pfds[1];
 
-    /*
-     * DOWN side initialization
-     */
+    /* DOWN side initialization */
     if ((dw_pfd->fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         goto error;
     }
@@ -63,26 +60,88 @@ int proxy_loop_do(cmdopts_t *opts)
     }
     dw_pfd->events = POLLIN;
 
-    /*
-     * UP side initialization
-     */
+    /* UP side initialization (immutable things only) */
+    struct sockaddr_in up_sain = {
+        .sin_family = AF_INET,
+        .sin_addr = opts->up_addr,
+        .sin_port = opts->up_port
+    };
 
     for (;;) {
-        int pcode = ppoll(pfds, 1, NULL, NULL);
+        char msg[MAX_PREFIX_SIZE + MAX_DGRAM_SIZE];
+        int  msg_l = 0; /* actual length of message data */
+        int  msg_c = 0; /* message cursor allow us to send the message partially */
+
+        int  up_is_alive = 0; /* 1 if upstream socket connection is alive */
+        int  up_buff_s   = 0; /* upstream socket buffer total size        */
+        int  up_buff_l   = 0; /* upstream socket buffer total size        */
+
+        /* first of all, care about UP side connection */
+        if (up_pfd->fd < 0) {
+            if ((up_pfd->fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+                goto error;
+            }
+            if (fcntl(up_pfd->fd, F_SETFL, O_NONBLOCK) < 0) {
+                goto error;
+            }
+            int sockopt = 1;
+            if (setsockopt(up_pfd->fd, SOL_SOCKET, SO_REUSEADDR, &sockopt, sizeof(sockopt)) < 0) {
+                goto error;
+            }
+            /* SOCK_DGRAM nature allow us do not care about messages split/re-assembly even on NONBLOCK mode
+             * however, for SOCK_STREAM we also want to make our message-sent operations atomic
+             *
+             * unfortunately we can't adjust SO_SNDLOWAT option on Linux,
+             * but can rely on SO_SNDBUF-SIOCOUTQ (total SNDBUFF - filled SNDBUFF) difference */
+            socklen_t sockopt_len = sizeof(up_buff_s);
+            if (getsockopt(up_pfd->fd, SOL_SOCKET, SO_SNDBUF, &up_buff_s, &sockopt_len) < 0) {
+                goto error;
+            }
+            printf("up_buff_s: %d bytes\n", up_buff_s);
+
+
+            int ccode = connect(up_pfd->fd, (struct sockaddr *)(&up_sain), sizeof(up_sain));
+            if ((ccode < 0) && (errno != EINPROGRESS)) {
+                goto error;
+            }
+            if (ccode < 0) {
+                /* connection in progress. Wait for POLLOUT */
+                up_pfd->events = POLLOUT;
+            } else {
+                /* immediately connected */
+                up_is_alive = 1;
+            }
+        }
+
+        int pcode = ppoll(pfds, 2, NULL, NULL);
         if (pcode < 0) {
             goto error;
         }
+
+        if (up_pfd->revents & POLLOUT) {
+            up_is_alive = 1;
+            up_pfd->events = 0; /* we want one-shot POLLOUT event */
+        }
+        if ((up_pfd->revents & POLLHUP) || (up_pfd->revents & POLLERR)) {
+            up_is_alive = 0;
+            close(up_pfd->fd);
+            up_pfd->fd = -1;
+        }
+
         if (dw_pfd->revents & POLLIN) {
-            char   msg[MAX_PREFIX_SIZE + MAX_DGRAM_SIZE];
-            int    msg_l = 0;
             struct sockaddr  dw_src;
             socklen_t        dw_src_l;
 
             /* we expect strictly one full-filled message per receive call or nothing
              * zero-sized messages are possible */
-            while ((msg_l = recvfrom(dw_pfd->fd, msg, sizeof(msg), 0, &dw_src, &dw_src_l)) >= 0) {
-                printf("%d bytes UDP message received: '%.*s'\n", msg_l, msg_l, msg);
+            while ((msg_l = recvfrom(dw_pfd->fd, msg, MAX_DGRAM_SIZE, 0, &dw_src, &dw_src_l)) >= 0) {
+                if (up_is_alive == 0) {
+                    /* just skip the message */
+                } else {
+                    printf("forward %d bytes to upstream: '%.*s'\n", msg_l, msg_l, msg);
+                }
             }
+
             if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
                 /* no data to read */
                 continue;
