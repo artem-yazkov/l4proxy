@@ -89,14 +89,22 @@ int proxy_loop_do(cmdopts_t *opts)
     struct timespec tm_heartsink = {0};
 
     /* Signal mask initialization */
-    struct sigaction sigact;
-    sigact.sa_handler = signal_quit_handler;
-    sigemptyset(&sigact.sa_mask);
-    sigact.sa_flags = 0;
+    sigset_t sigset;
+    struct sigaction sa;
 
-    sigaction(SIGHUP,  &sigact, NULL);
-    sigaction(SIGINT,  &sigact, NULL);
-    sigaction(SIGTERM, &sigact, NULL);
+    sigemptyset(&sigset);
+    sigaddset(&sigset, SIGHUP);
+    sigaddset(&sigset, SIGINT);
+    sigaddset(&sigset, SIGTERM);
+    sigprocmask(SIG_SETMASK, &sigset, NULL);
+
+    sigemptyset(&sigset);
+    sa.sa_handler = &signal_quit_handler;
+    sa.sa_mask = sigset;
+    sa.sa_flags = 0;
+    sigaction(SIGHUP,  &sa, NULL);
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 
     for (;;) {
         /* care about UP side (re)connection */
@@ -120,13 +128,14 @@ int proxy_loop_do(cmdopts_t *opts)
         }
 
         /* take UP/DOWN events */
-        int pcode = ppoll(pfds, 2, &tm_heartbeat, &sigact.sa_mask);
+        int pcode = ppoll(pfds, 2, &tm_heartbeat, &sigset);
+
+        if (signal_quit_flag) {
+            printf("%d signal was got; quit\n", signal_quit_flag);
+            goto finalize;
+        }
         if (pcode < 0) {
             goto error;
-        }
-        if (signal_quit_flag) {
-            printf("%d signal was got; exit\n", signal_quit_flag);
-            goto finalize;
         }
 
         if (up_state == UPSTATE_HEARTSINK) {
