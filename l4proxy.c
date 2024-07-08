@@ -33,8 +33,9 @@ typedef struct cmdopts_s {
     size_t          prefix_len;
 } cmdopts_t;
 
+void  help_show(void);
 int   cmdopts_parse_creds(const char *optname, char *credline, struct in_addr *addr, in_port_t *port);
-int   cmdopts_parse(int argc, char **argv, cmdopts_t *opts, bool *help);
+int   cmdopts_parse(int argc, char **argv, cmdopts_t *opts, bool *flhelp);
 
 FILE *log_stream;
 char *log_filename;
@@ -47,10 +48,14 @@ void  signal_quit_handler(int signum);
 
 int main(int argc, char **argv)
 {
-    bool fl_help = 0;
+    bool flhelp = 0;
     cmdopts_t opts = (cmdopts_t){0};
-    if (cmdopts_parse(argc, argv, &opts, &fl_help) < 0) {
+    if (cmdopts_parse(argc, argv, &opts, &flhelp) < 0) {
         return 1;
+    }
+    if (flhelp) {
+        help_show();
+        return 0;
     }
     int retcode = proxy_loop_do(&opts);
 
@@ -60,6 +65,27 @@ int main(int argc, char **argv)
         fclose(log_stream);
     }
     return (retcode == 0) ? 0 : 1;
+}
+
+void help_show(void)
+{
+    const char *help[] = {
+        "Usage:",
+        "    l4proxy --down <addr>:<port> --up <addr>:<port> --prefix <4-char>  [--log <logfile>] [--help]",
+        "",
+        "Parameters here (mandatory)",
+        "    --down <ipv4 addr>:<port>   DOWN side socket address from which UDP packets are received",
+        "    --up   <ipv4 addr>:<port>   UP side socket address to which TCP packets are sent",
+        "    --prefix    <4-char line>   Any utf8 characters, 4 pieces strictly ",
+        "Parameters here (optional)",
+        "    --log  <log file>           File to log output. By default, standard input/error used",
+        "    --help                      Show this help",
+        NULL
+    };
+    for (int il = 0; help[il]; il++) {
+        printf("%s\n", help[il]);
+    }
+    printf("\n");
 }
 
 int cmdopts_parse_creds(const char *optname, char *credline, struct in_addr *addr, in_port_t *port)
@@ -81,17 +107,7 @@ int cmdopts_parse_creds(const char *optname, char *credline, struct in_addr *add
     return 0;
 }
 
-int u8strlen(const char *s)
-{
-  int len=0;
-  while (*s) {
-    if ((*s & 0xC0) != 0x80) len++ ;
-    s++;
-  }
-  return len;
-}
-
-int cmdopts_parse(int argc, char **argv, cmdopts_t *opts, bool *help)
+int cmdopts_parse(int argc, char **argv, cmdopts_t *opts, bool *flhelp)
 {
     int   retcode = 0;
     char *shortopts = "d:u:p:l:h";
@@ -122,11 +138,11 @@ int cmdopts_parse(int argc, char **argv, cmdopts_t *opts, bool *help)
             log_filename = strdup(optarg);
             break;
         case 'h':
-            *help = 1;
+            *flhelp = 1;
             return 0;
         default:
-            fprintf(stderr, "unexpected option was found\n");
-            *help = 1;
+            fprintf(stderr, "    unexpected option was found\n");
+            *flhelp = 1;
             return -1;
         }
     }
@@ -140,6 +156,7 @@ int cmdopts_parse(int argc, char **argv, cmdopts_t *opts, bool *help)
         printf("    --prefix option must be set\n");
         retcode = -1;
     } else {
+        /* assume UTF-8 characters */
         for (char *pc = opts->prefix; *pc; pc++) {
             if ((*pc & 0xC0) != 0x80) {
                 opts->prefix_len++;
@@ -388,7 +405,7 @@ int proxy_loop_do(cmdopts_t *opts)
              * zero-sized messages are possible */
             while ((msg_dt = recvfrom(dw_pfd->fd, &msg[opts->prefix_len], MAX_DGRAM_SZ_MAX, 0, &dw_src, &dw_src_l)) >= 0) {
                 if ((up_state == UPSTATE_CONNECTED) &&
-                    //(msg_dt >= MAX_DGRAM_SZ_MIN) &&
+                    (msg_dt >= MAX_DGRAM_SZ_MIN) &&
                     (msg_dt < upbuf_fr)
                 ) {
                     int scode = send(up_pfd->fd, msg, opts->prefix_len + msg_dt, 0);
