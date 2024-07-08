@@ -1,6 +1,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <time.h>
 #include <unistd.h>
@@ -23,8 +24,10 @@ typedef struct cmdopts_s {
     size_t          prefix_len;
 } cmdopts_t;
 
-int proxy_loop_do(cmdopts_t *opts);
+int  proxy_loop_do(cmdopts_t *opts);
 
+int  signal_quit_flag;
+void signal_quit_handler(int signum);
 
 int main(int argc, char **argv)
 {
@@ -85,6 +88,16 @@ int proxy_loop_do(cmdopts_t *opts)
     struct timespec tm_heartbeat = {.tv_sec = 1};
     struct timespec tm_heartsink = {0};
 
+    /* Signal mask initialization */
+    struct sigaction sigact;
+    sigact.sa_handler = signal_quit_handler;
+    sigemptyset(&sigact.sa_mask);
+    sigact.sa_flags = 0;
+
+    sigaction(SIGHUP,  &sigact, NULL);
+    sigaction(SIGINT,  &sigact, NULL);
+    sigaction(SIGTERM, &sigact, NULL);
+
     for (;;) {
         /* care about UP side (re)connection */
         if (up_state == UPSTATE_INIT) {
@@ -107,10 +120,15 @@ int proxy_loop_do(cmdopts_t *opts)
         }
 
         /* take UP/DOWN events */
-        int pcode = ppoll(pfds, 2, &tm_heartbeat, NULL);
+        int pcode = ppoll(pfds, 2, &tm_heartbeat, &sigact.sa_mask);
         if (pcode < 0) {
             goto error;
         }
+        if (signal_quit_flag) {
+            printf("%d signal was got; exit\n", signal_quit_flag);
+            goto finalize;
+        }
+
         if (up_state == UPSTATE_HEARTSINK) {
             /* HEARTSINK is an intermediate state between CONNECTED and INIT
              * adds the necessary pause for UP side reconnect and eliminate
@@ -132,7 +150,7 @@ int proxy_loop_do(cmdopts_t *opts)
         if ((up_pfd->revents & POLLHUP) || (up_pfd->revents & POLLERR)) {
             /* error on UP side socket was happen */
             close(up_pfd->fd);
-            up_pfd->fd = -1;  /* no more UP side events until reinitialize */
+            up_pfd->fd = -1;  /* no more UP side events until reconnect */
             if (clock_gettime(CLOCK_REALTIME, &tm_heartsink) < 0) {
                 goto error;
             }
@@ -219,4 +237,9 @@ finalize:
         close(up_pfd->fd);
     }
     return retcode;
+}
+
+void signal_quit_handler(int signum)
+{
+    signal_quit_flag = signum;
 }
