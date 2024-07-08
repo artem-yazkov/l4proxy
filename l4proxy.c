@@ -1,13 +1,15 @@
-#include <stdbool.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdarg.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
 #include <time.h>
 #include <unistd.h>
 #include <wchar.h>
@@ -29,16 +31,19 @@ typedef struct cmdopts_s {
     in_port_t       up_port;
     char           *prefix;
     size_t          prefix_len;
-    char           *logfile;
 } cmdopts_t;
 
-int  cmdopts_parse_creds(const char *optname, char *credline, struct in_addr *addr, in_port_t *port);
-int  cmdopts_parse(int argc, char **argv, cmdopts_t *opts, bool *help);
+int   cmdopts_parse_creds(const char *optname, char *credline, struct in_addr *addr, in_port_t *port);
+int   cmdopts_parse(int argc, char **argv, cmdopts_t *opts, bool *help);
 
-int  proxy_loop_do(cmdopts_t *opts);
+FILE *log_stream;
+char *log_filename;
+int   log__(int severity, const char *format, ...);
 
-int  signal_quit_flag;
-void signal_quit_handler(int signum);
+int   proxy_loop_do(cmdopts_t *opts);
+
+int   signal_quit_flag;
+void  signal_quit_handler(int signum);
 
 int main(int argc, char **argv)
 {
@@ -47,16 +52,14 @@ int main(int argc, char **argv)
     if (cmdopts_parse(argc, argv, &opts, &fl_help) < 0) {
         return 1;
     }
+    int retcode = proxy_loop_do(&opts);
 
-    inet_aton("0.0.0.0", &opts.dw_addr);
-    opts.dw_port = htons((uint16_t)8080);
-
-    inet_aton("192.168.31.146", &opts.up_addr);
-    opts.up_port = htons((uint16_t)1234);
-
-    proxy_loop_do(&opts);
-
-    return 0;
+    free(log_filename);
+    free(opts.prefix);
+    if (log_stream) {
+        fclose(log_stream);
+    }
+    return (retcode == 0) ? 0 : 1;
 }
 
 int cmdopts_parse_creds(const char *optname, char *credline, struct in_addr *addr, in_port_t *port)
@@ -74,6 +77,7 @@ int cmdopts_parse_creds(const char *optname, char *credline, struct in_addr *add
         fprintf(stderr, "    %s has incorrect port number\n", optname);
         return -1;
     }
+    *port = htons((in_port_t)atoi(s_port));
     return 0;
 }
 
@@ -95,7 +99,7 @@ int cmdopts_parse(int argc, char **argv, cmdopts_t *opts, bool *help)
         {"down",       required_argument, NULL, 'd'},
         {"up",         required_argument, NULL, 'u'},
         {"prefix",     required_argument, NULL, 'p'},
-        {"log-file",   optional_argument, NULL, 'l'},
+        {"log",        required_argument, NULL, 'l'},
         {"help",       no_argument,       NULL, 'h'},
         {NULL,         0,                 NULL,  0}
     };
@@ -115,7 +119,7 @@ int cmdopts_parse(int argc, char **argv, cmdopts_t *opts, bool *help)
             opts->prefix = strdup(optarg);
             break;
         case 'l':
-            opts->logfile = strdup(optarg);
+            log_filename = strdup(optarg);
             break;
         case 'h':
             *help = 1;
@@ -126,9 +130,10 @@ int cmdopts_parse(int argc, char **argv, cmdopts_t *opts, bool *help)
             return -1;
         }
     }
-    if ((cmdopts_parse_creds("--down", dw_str, &opts->dw_addr, &opts->dw_port) < 0) ||
-        (cmdopts_parse_creds("--up", up_str, &opts->up_addr, &opts->up_port) < 0)
-        ) {
+    if (cmdopts_parse_creds("--down", dw_str, &opts->dw_addr, &opts->dw_port) < 0) {
+        retcode = -1;
+    }
+    if (cmdopts_parse_creds("--up", up_str, &opts->up_addr, &opts->up_port) < 0) {
         retcode = -1;
     }
     if (!opts->prefix) {
@@ -149,10 +154,60 @@ int cmdopts_parse(int argc, char **argv, cmdopts_t *opts, bool *help)
             retcode = -1;
         }
     }
+
     free(dw_str);
     free(up_str);
 
     return retcode;
+}
+
+int log__(int severity, const char *format, ...)
+{
+    static bool fallback;
+    FILE *outstream = (severity <= LOG_ERR) ? stderr : stdout;
+
+    if (!fallback && !log_stream && log_filename) {
+        if ((log_stream = fopen(log_filename, "a+")) != NULL) {
+            outstream = log_stream;
+        } else {
+            /* only one attempt to open log file */
+            printf("[ERR] can't open|create %s file: %s\n\t log via standard streams\n", log_filename, strerror(errno));
+            fallback = true;
+        }
+    } else if (!fallback && log_stream) {
+        if (!ferror(log_stream)) {
+            outstream = log_stream;
+        } else {
+            printf("[ERR] can't work with log file stream\n\t log via standard streams\n");
+            /* does not try to fix log file IO issues */
+            fallback = true;
+        }
+    }
+
+    char *slevel;
+    if (severity <= LOG_ERR) {
+        slevel = "[ERR]";
+    } else if (severity <= LOG_INFO) {
+        slevel = "[INF]";
+    } else {
+        slevel = "[DBG]";
+    }
+    fprintf(outstream, "%s  ", slevel);
+
+    va_list args;
+    va_start(args, format);
+    vfprintf(outstream, format, args);
+    va_end(args);
+
+    if ((severity <= LOG_ERR) && errno) {
+        fprintf(outstream, "  err: %d (%s)\n", errno, strerror(errno));
+        errno = 0;
+    } else {
+        fprintf(outstream, "\n");
+    }
+    fflush(outstream);
+
+    return (fallback || ferror(outstream)) ? -1 : 0;
 }
 
 int proxy_loop_do(cmdopts_t *opts)
@@ -167,9 +222,11 @@ int proxy_loop_do(cmdopts_t *opts)
 
     /* DOWN side initialization */
     if ((dw_pfd->fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+        log__(LOG_ERR, "DOWN socket initialization error");
         goto error;
     }
     if (fcntl(dw_pfd->fd, F_SETFL, O_NONBLOCK) < 0) {
+        log__(LOG_ERR, "DOWN socket flag set error");
         goto error;
     }
     /* no need to set REUSEADDR flag for SOCK_DGRAM since we don't want multicast support */
@@ -179,9 +236,11 @@ int proxy_loop_do(cmdopts_t *opts)
         .sin_port = opts->dw_port
     };
     if (bind(dw_pfd->fd , (struct sockaddr *)(&dw_sain), sizeof(dw_sain)) < 0) {
+        log__(LOG_ERR, "DOWN socket bind error");
         goto error;
     }
     dw_pfd->events = POLLIN;
+    log__(LOG_INFO, "DOWN side connection initialized successfully");
 
     /* UP side initialization (immutable things only) */
     struct sockaddr_in up_sain = {
@@ -189,16 +248,6 @@ int proxy_loop_do(cmdopts_t *opts)
         .sin_addr = opts->up_addr,
         .sin_port = opts->up_port
     };
-
-    /* Event Loop initialization */
-    enum upstate_e {
-        UPSTATE_INIT,
-        UPSTATE_CONNECTING,
-        UPSTATE_CONNECTED,
-        UPSTATE_HEARTSINK
-    } up_state = UPSTATE_INIT;
-    struct timespec tm_heartbeat = {.tv_sec = 1};
-    struct timespec tm_heartsink = {0};
 
     /* Signal mask initialization */
     sigset_t sigset;
@@ -218,35 +267,54 @@ int proxy_loop_do(cmdopts_t *opts)
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
+    /* Event Loop initialization */
+    enum upstate_e {
+        UPSTATE_INIT,
+        UPSTATE_CONNECTING,
+        UPSTATE_CONNECTED,
+        UPSTATE_HEARTSINK
+    } up_state = UPSTATE_INIT;
+    struct timespec tm_heartbeat = {.tv_sec = 1};
+    struct timespec tm_heartsink = {0};
+    char            msg[MAX_PREFIX_SZ_MAX + MAX_DGRAM_SZ_MAX];
+    int             msg_dt = 0;
+    memcpy(msg, opts->prefix, opts->prefix_len);
+
     for (;;) {
         /* care about UP side (re)connection */
         if (up_state == UPSTATE_INIT) {
             if ((up_pfd->fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+                log__(LOG_ERR, "UP socket initialization error");
                 goto error;
             }
             if (fcntl(up_pfd->fd, F_SETFL, O_NONBLOCK) < 0) {
+                log__(LOG_ERR, "UP socket flag set error");
                 goto error;
             }
             int sockopt = 1;
             if (setsockopt(up_pfd->fd, SOL_SOCKET, SO_REUSEADDR, &sockopt, sizeof(sockopt)) < 0) {
+                log__(LOG_ERR, "UP socket option set error");
                 goto error;
             }
             int ccode = connect(up_pfd->fd, (struct sockaddr *)(&up_sain), sizeof(up_sain));
             if ((ccode < 0) && (errno != EINPROGRESS)) {
+                log__(LOG_ERR, "UP socket connect error");
                 goto error;
             }
             up_pfd->events = POLLOUT;
             up_state = UPSTATE_CONNECTING;
+            log__(LOG_INFO, "UP side connection state change: INIT -> CONNECTING");
         }
 
         /* take UP/DOWN events */
         int pcode = ppoll(pfds, 2, &tm_heartbeat, &sigset);
 
         if (signal_quit_flag) {
-            printf("%d signal was got; quit\n", signal_quit_flag);
+            log__(LOG_INFO, "%d signal was got; gently quit", signal_quit_flag);
             goto finalize;
         }
         if (pcode < 0) {
+            log__(LOG_INFO, "unexpected POLL error");
             goto error;
         }
 
@@ -265,6 +333,7 @@ int proxy_loop_do(cmdopts_t *opts)
             uint64_t tm64_htb = tm_heartbeat.tv_sec * (uint64_t)1000000000L + tm_heartbeat.tv_nsec;
             if ((tm64_cur - tm64_hts) >= tm64_htb) {
                 up_state = UPSTATE_INIT;
+                log__(LOG_INFO, "UP side connection state change: HEARTSINK -> INIT");
             }
         }
 
@@ -273,20 +342,21 @@ int proxy_loop_do(cmdopts_t *opts)
             close(up_pfd->fd);
             up_pfd->fd = -1;  /* no more UP side events until reconnect */
             if (clock_gettime(CLOCK_REALTIME, &tm_heartsink) < 0) {
+                log__(LOG_INFO, "clock_gettime error");
                 goto error;
             }
             up_state = UPSTATE_HEARTSINK;
+            log__(LOG_INFO, "UP side connection got HUP|ERR events, switch to HEARTSINK");
         } else if (up_pfd->revents & POLLOUT) {
             /* UP side socket is good */
             up_state = UPSTATE_CONNECTED;
+            log__(LOG_INFO, "UP side connection state change: CONNECTING -> CONNECTED");
             up_pfd->events = 0; /* stop POLLOUT flood */
         }
 
         if (dw_pfd->revents & POLLIN) {
             struct sockaddr  dw_src;
             socklen_t        dw_src_l;
-            char             msg[MAX_PREFIX_SZ_MAX + MAX_DGRAM_SZ_MAX];
-            int              msg_dt = 0;
 
             /* SOCK_DGRAM nature allow us do not care about messages split/re-assembly even on NONBLOCK mode
              * for SOCK_STREAM we also want to make our message-sent operations atomic
@@ -301,16 +371,17 @@ int proxy_loop_do(cmdopts_t *opts)
             if (up_state == UPSTATE_CONNECTED) {
                 socklen_t upbuf_sz_le = sizeof(upbuf_sz);
                 if (getsockopt(up_pfd->fd, SOL_SOCKET, SO_SNDBUF, &upbuf_sz, &upbuf_sz_le) < 0) {
+                    log__(LOG_ERR, "UP socket option get error");
                     goto error;
                 }
                 if (ioctl(up_pfd->fd, SIOCOUTQ, &upbuf_dt) < 0) {
+                    log__(LOG_ERR, "UP socket SIOCOUTQ command error");
                     goto error;
                 }
                 upbuf_fr = (upbuf_sz > upbuf_dt) ? (upbuf_sz - upbuf_dt) : 0;
                 if (!upbuf_fr) {
                     continue;
                 }
-                printf("upbuf_sz: %d, upbuf_dt: %d, upbuf_fr: %d\n", upbuf_sz, upbuf_dt, upbuf_fr);
             }
 
             /* we expect strictly one full-filled message per receive call or nothing
@@ -320,19 +391,18 @@ int proxy_loop_do(cmdopts_t *opts)
                     //(msg_dt >= MAX_DGRAM_SZ_MIN) &&
                     (msg_dt < upbuf_fr)
                 ) {
-                    printf("forward %d bytes message: '%.*s'\n", msg_dt, msg_dt, &msg[opts->prefix_len]);
                     int scode = send(up_pfd->fd, msg, opts->prefix_len + msg_dt, 0);
-                    if (scode != opts->prefix_len + msg_dt) {
+                    if (scode != (int)opts->prefix_len + msg_dt) {
                         /* unexpected state; close UP socket
                          * socket state will fall into UPSTATE_HEARTSINK on POLLHUP event */
+                        log__(LOG_ERR, "UP socket unexpected send() result");
                         close(up_pfd->fd);
                         break;
                     } else {
                         upbuf_fr -= scode;
-                        printf("was sent successfully\n");
                     }
                 } else {
-                    printf("discard %d bytes message: '%.*s'\n", msg_dt, msg_dt, &msg[opts->prefix_len]);
+                    log__(LOG_DEBUG, "discard %d bytes message: '%.*s'\n", msg_dt, msg_dt, &msg[opts->prefix_len]);
                     /* just discard the message */
                 }
             }
