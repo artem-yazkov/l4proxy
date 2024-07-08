@@ -1,10 +1,17 @@
+#include <stdbool.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <getopt.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <wchar.h>
+
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/ioctl.h>
@@ -22,7 +29,11 @@ typedef struct cmdopts_s {
     in_port_t       up_port;
     char           *prefix;
     size_t          prefix_len;
+    char           *logfile;
 } cmdopts_t;
+
+int  cmdopts_parse_creds(const char *optname, char *credline, struct in_addr *addr, in_port_t *port);
+int  cmdopts_parse(int argc, char **argv, cmdopts_t *opts, bool *help);
 
 int  proxy_loop_do(cmdopts_t *opts);
 
@@ -31,7 +42,12 @@ void signal_quit_handler(int signum);
 
 int main(int argc, char **argv)
 {
+    bool fl_help = 0;
     cmdopts_t opts = (cmdopts_t){0};
+    if (cmdopts_parse(argc, argv, &opts, &fl_help) < 0) {
+        return 1;
+    }
+
     inet_aton("0.0.0.0", &opts.dw_addr);
     opts.dw_port = htons((uint16_t)8080);
 
@@ -41,6 +57,102 @@ int main(int argc, char **argv)
     proxy_loop_do(&opts);
 
     return 0;
+}
+
+int cmdopts_parse_creds(const char *optname, char *credline, struct in_addr *addr, in_port_t *port)
+{
+    char *s_addr, *s_port;
+    if (!credline || !((s_addr = strtok(credline, ":"))) || !((s_port = strtok(NULL, ":")))) {
+        fprintf(stderr, "    %s must be tuple in form <ipaddr>:<port>\n", optname);
+        return -1;
+    }
+    if (!inet_aton(s_addr, addr)) {
+        fprintf(stderr, "    %s has incorrect ip addr\n", optname);
+        return -1;
+    }
+    if ((atoi(s_port) <= 0) || (atoi(s_port) > UINT16_MAX)) {
+        fprintf(stderr, "    %s has incorrect port number\n", optname);
+        return -1;
+    }
+    return 0;
+}
+
+int u8strlen(const char *s)
+{
+  int len=0;
+  while (*s) {
+    if ((*s & 0xC0) != 0x80) len++ ;
+    s++;
+  }
+  return len;
+}
+
+int cmdopts_parse(int argc, char **argv, cmdopts_t *opts, bool *help)
+{
+    int   retcode = 0;
+    char *shortopts = "d:u:p:l:h";
+    struct option longopts[] = {
+        {"down",       required_argument, NULL, 'd'},
+        {"up",         required_argument, NULL, 'u'},
+        {"prefix",     required_argument, NULL, 'p'},
+        {"log-file",   optional_argument, NULL, 'l'},
+        {"help",       no_argument,       NULL, 'h'},
+        {NULL,         0,                 NULL,  0}
+    };
+    char *dw_str = NULL;
+    char *up_str = NULL;
+
+    int   opt;
+    while ((opt = getopt_long(argc, argv, shortopts, longopts, NULL)) != -1) {
+        switch(opt) {
+        case 'd':
+            dw_str =strdup(optarg);
+            break;
+        case 'u':
+            up_str = strdup(optarg);
+            break;
+        case 'p':
+            opts->prefix = strdup(optarg);
+            break;
+        case 'l':
+            opts->logfile = strdup(optarg);
+            break;
+        case 'h':
+            *help = 1;
+            return 0;
+        default:
+            fprintf(stderr, "unexpected option was found\n");
+            *help = 1;
+            return -1;
+        }
+    }
+    if ((cmdopts_parse_creds("--down", dw_str, &opts->dw_addr, &opts->dw_port) < 0) ||
+        (cmdopts_parse_creds("--up", up_str, &opts->up_addr, &opts->up_port) < 0)
+        ) {
+        retcode = -1;
+    }
+    if (!opts->prefix) {
+        printf("    --prefix option must be set\n");
+        retcode = -1;
+    } else {
+        for (char *pc = opts->prefix; *pc; pc++) {
+            if ((*pc & 0xC0) != 0x80) {
+                opts->prefix_len++;
+            }
+        }
+        if (opts->prefix_len != 4) {
+            printf("    --prefix must be exactly 4 characters width\n");
+            retcode = -1;
+        }
+        if ((opts->prefix_len = strlen(opts->prefix)) > MAX_PREFIX_SZ_MAX) {
+            printf("    --prefix contain unexpected utf-8 string\n");
+            retcode = -1;
+        }
+    }
+    free(dw_str);
+    free(up_str);
+
+    return retcode;
 }
 
 int proxy_loop_do(cmdopts_t *opts)
@@ -157,7 +269,7 @@ int proxy_loop_do(cmdopts_t *opts)
         }
 
         if ((up_pfd->revents & POLLHUP) || (up_pfd->revents & POLLERR)) {
-            /* error on UP side socket was happen */
+            /* some error on UP side socket was happen */
             close(up_pfd->fd);
             up_pfd->fd = -1;  /* no more UP side events until reconnect */
             if (clock_gettime(CLOCK_REALTIME, &tm_heartsink) < 0) {
