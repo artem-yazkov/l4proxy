@@ -51,6 +51,7 @@ int main(int argc, char **argv)
     bool flhelp = 0;
     cmdopts_t opts = (cmdopts_t){0};
     if (cmdopts_parse(argc, argv, &opts, &flhelp) < 0) {
+        fprintf(stderr, "show all message via \"l4proxy --help\"\n");
         return 1;
     }
     if (flhelp) {
