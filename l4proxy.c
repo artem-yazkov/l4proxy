@@ -331,7 +331,7 @@ int proxy_loop_do(cmdopts_t *opts)
             goto finalize;
         }
         if (pcode < 0) {
-            log__(LOG_INFO, "unexpected POLL error");
+            log__(LOG_ERR, "unexpected POLL error");
             goto error;
         }
 
@@ -359,11 +359,11 @@ int proxy_loop_do(cmdopts_t *opts)
             close(up_pfd->fd);
             up_pfd->fd = -1;  /* no more UP side events until reconnect */
             if (clock_gettime(CLOCK_REALTIME, &tm_heartsink) < 0) {
-                log__(LOG_INFO, "clock_gettime error");
+                log__(LOG_ERR, "clock_gettime error");
                 goto error;
             }
             up_state = UPSTATE_HEARTSINK;
-            log__(LOG_INFO, "UP side connection got HUP|ERR events, switch to HEARTSINK");
+            log__(LOG_ERR, "UP side connection got HUP|ERR events, switch to HEARTSINK");
         } else if (up_pfd->revents & POLLOUT) {
             /* UP side socket is good */
             up_state = UPSTATE_CONNECTED;
@@ -428,6 +428,7 @@ int proxy_loop_do(cmdopts_t *opts)
                 /* no data to read */
                 continue;
             } else {
+                log__(LOG_ERR, "DOWN socket unexpected receive");
                 goto error;
             }
         }
