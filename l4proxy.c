@@ -20,9 +20,9 @@
 #include <sys/time.h>
 #include <linux/sockios.h>
 
-#define MAX_PREFIX_SZ_MAX    16
-#define MAX_DGRAM_SZ_MAX    128
-#define MAX_DGRAM_SZ_MIN     16
+#define MAX_PREFIX_SZ    16
+#define MIN_DGRAM_SZ     16
+#define MAX_DGRAM_SZ    128
 
 typedef struct cmdopts_s {
     struct in_addr  dw_addr;
@@ -147,16 +147,16 @@ int cmdopts_parse(int argc, char **argv, cmdopts_t *opts, bool *flhelp)
             return -1;
         }
     }
-    if (cmdopts_parse_creds("--down", dw_str, &opts->dw_addr, &opts->dw_port) < 0) {
+    if (!retcode && (cmdopts_parse_creds("--down", dw_str, &opts->dw_addr, &opts->dw_port) < 0)) {
         retcode = -1;
     }
-    if (cmdopts_parse_creds("--up", up_str, &opts->up_addr, &opts->up_port) < 0) {
+    if (! retcode && (cmdopts_parse_creds("--up", up_str, &opts->up_addr, &opts->up_port) < 0)) {
         retcode = -1;
     }
-    if (!opts->prefix) {
+    if (!retcode && !opts->prefix) {
         printf("    --prefix option must be set\n");
         retcode = -1;
-    } else {
+    } else if (!retcode) {
         /* assume UTF-8 characters */
         for (char *pc = opts->prefix; *pc; pc++) {
             if ((*pc & 0xC0) != 0x80) {
@@ -167,8 +167,8 @@ int cmdopts_parse(int argc, char **argv, cmdopts_t *opts, bool *flhelp)
             printf("    --prefix must be exactly 4 characters width\n");
             retcode = -1;
         }
-        if ((opts->prefix_len = strlen(opts->prefix)) > MAX_PREFIX_SZ_MAX) {
-            printf("    --prefix contain unexpected utf-8 string\n");
+        if ((opts->prefix_len = strlen(opts->prefix)) > MAX_PREFIX_SZ) {
+            printf("    --prefix contain unexpected UTF-8 string\n");
             retcode = -1;
         }
     }
@@ -294,7 +294,7 @@ int proxy_loop_do(cmdopts_t *opts)
     } up_state = UPSTATE_INIT;
     struct timespec tm_heartbeat = {.tv_sec = 1};
     struct timespec tm_heartsink = {0};
-    char            msg[MAX_PREFIX_SZ_MAX + MAX_DGRAM_SZ_MAX];
+    char            msg[MAX_PREFIX_SZ + MAX_DGRAM_SZ + 1];
     int             msg_dt = 0;
     memcpy(msg, opts->prefix, opts->prefix_len);
 
@@ -378,7 +378,7 @@ int proxy_loop_do(cmdopts_t *opts)
 
             /* SOCK_DGRAM nature allow us do not care about messages split/re-assembly even on NONBLOCK mode
              * for SOCK_STREAM we also want to make our message-sent operations atomic
-             * (otherwise we need to save up incoming UDP messages that goes against the task requirements)
+             * (otherwise we need to save up incoming UDP messages that goes against design requirements)
              *
              * so lets sent only if we have enough space in socket buffer for entire message;
              * discard the message otherwise */
@@ -404,10 +404,12 @@ int proxy_loop_do(cmdopts_t *opts)
 
             /* we expect strictly one full-filled message per receive call or nothing
              * zero-sized messages are possible */
-            while ((msg_dt = recvfrom(dw_pfd->fd, &msg[opts->prefix_len], MAX_DGRAM_SZ_MAX, 0, &dw_src, &dw_src_l)) >= 0) {
+            while ((msg_dt = recvfrom(dw_pfd->fd, &msg[opts->prefix_len], MAX_DGRAM_SZ + 1, 0, &dw_src, &dw_src_l)) >= 0) {
+                /* take only messages within MIN_DGRAM_SZ .. MAX_DGRAM_SZ interval; discard others */
                 if ((up_state == UPSTATE_CONNECTED) &&
-                    (msg_dt >= MAX_DGRAM_SZ_MIN) &&
-                    (msg_dt < upbuf_fr)
+                    (msg_dt >= MIN_DGRAM_SZ) &&
+                    (msg_dt <= MAX_DGRAM_SZ) &&
+                    (msg_dt <= upbuf_fr)
                 ) {
                     int scode = send(up_pfd->fd, msg, opts->prefix_len + msg_dt, 0);
                     if (scode != (int)opts->prefix_len + msg_dt) {
